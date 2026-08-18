@@ -19,8 +19,8 @@ Automated attributes (structural group only):
 
 B1 and B2 must be aggregated across a full 30 m survey section, not scored
 per image. A1/A2 must exclude gap regions from the calculation. This
-prototype currently automates optical porosity (feeding B2) and a
-trigonometric height estimate (feeding A1) from HSV color thresholding.
+prototype currently automates optical porosity (feeding B2) and a hedge
+height estimate (feeding A1) from HSV color thresholding.
 Width, basal gap and damage are not yet implemented.
 """
 
@@ -41,61 +41,97 @@ B2_MAX_SINGLE_GAP_M = 5.0
 SECTION_LENGTH_M = 30.0
 
 # ---------------------------------------------------------------------------
-# Sky/gap segmentation (classical HSV thresholding, no ML model)
+# Gap segmentation (classical HSV thresholding, no ML model)
 # ---------------------------------------------------------------------------
-# "Sky/gap" = bright & desaturated (overcast sky, blown-out gaps) OR blue hue
-# (clear sky). Tuned against a real head-on hedgerow photo
-# (hedgerow-trim-16896461364.jpg): the original wide thresholds classified
-# sunlit grass highlights (H~44, S~53, V~226) and a worker's teal-green
-# trousers (H~85-94, S~195-255) as gap. Narrowing bright_s_max/bright_v_min
-# and requiring both higher saturation and higher brightness for the blue
-# rule drops false-positive rate in those regions from >10% to <1% while
-# still catching most sky visible through canopy gaps.
-HSV_BRIGHT_S_MAX = 25
-HSV_BRIGHT_V_MIN = 220
-HSV_BLUE_H_MIN = 100
-HSV_BLUE_H_MAX = 130
-HSV_BLUE_S_MIN = 70
-HSV_BLUE_V_MIN = 170
+# A "gap" is anything that ISN'T hedge material — foliage (any shade of
+# green) or woody branch/stem (brown/grey, low-mid brightness). Whatever
+# shows through a gap in the hedge — sky, a wall, a building, another plant
+# — is out of the classifier's control, so gap detection works by
+# recognising hedge material and calling everything else a gap, rather than
+# trying to enumerate every possible background.
+#
+# Tuned against a real head-on hedgerow photo (hedgerow-trim-16896461364.jpg)
+# whose background is a grey wall, not sky: sampled foliage pixels were
+# H 48-95 (green) with S >= 25 when lit, or very dark (V < 30, deep interior
+# shadow — treated as hedge, not a gap, since it's occlusion by the hedge's
+# own canopy rather than an opening). The wall itself sampled at H~26 S~12
+# V~166 — outside both the green-hue and dark-shadow ranges, so it correctly
+# falls out as gap. Earlier sky-only thresholds (see git history) would have
+# missed this wall entirely.
+HSV_FOLIAGE_HUE_MIN = 35
+HSV_FOLIAGE_HUE_MAX = 100
+HSV_FOLIAGE_SAT_MIN = 25
+HSV_BRANCH_HUE_MIN = 5
+HSV_BRANCH_HUE_MAX = 30
+HSV_BRANCH_SAT_MIN = 25
+HSV_BRANCH_SAT_MAX = 160
+HSV_BRANCH_VAL_MAX = 130
+HSV_SHADOW_VAL_MAX = 30
 
 
-def segment_sky_gap_mask(image_bgr: np.ndarray) -> np.ndarray:
-    """Return a boolean mask, True where the pixel is classified as sky/gap."""
+def segment_gap_mask(image_bgr: np.ndarray) -> np.ndarray:
+    """
+    Return a boolean mask, True where the pixel is classified as a gap
+    (anything that is not hedge foliage or branch/stem material).
+    """
     hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
     h, s, v = hsv[..., 0], hsv[..., 1], hsv[..., 2]
 
-    bright_desaturated = (s <= HSV_BRIGHT_S_MAX) & (v >= HSV_BRIGHT_V_MIN)
-    blue_sky = (
-        (h >= HSV_BLUE_H_MIN)
-        & (h <= HSV_BLUE_H_MAX)
-        & (s >= HSV_BLUE_S_MIN)
-        & (v >= HSV_BLUE_V_MIN)
+    green_foliage = (
+        (h >= HSV_FOLIAGE_HUE_MIN) & (h <= HSV_FOLIAGE_HUE_MAX) & (s >= HSV_FOLIAGE_SAT_MIN)
     )
+    brown_branch = (
+        (h >= HSV_BRANCH_HUE_MIN)
+        & (h <= HSV_BRANCH_HUE_MAX)
+        & (s >= HSV_BRANCH_SAT_MIN)
+        & (s <= HSV_BRANCH_SAT_MAX)
+        & (v <= HSV_BRANCH_VAL_MAX)
+    )
+    deep_shadow = v <= HSV_SHADOW_VAL_MAX
 
-    return bright_desaturated | blue_sky
+    is_hedge_material = green_foliage | brown_branch | deep_shadow
+    return ~is_hedge_material
 
 
 def optical_porosity_pct(mask: np.ndarray) -> float:
-    """Percentage of the frame classified as sky/gap."""
+    """Percentage of the frame classified as gap."""
     return 100.0 * float(np.count_nonzero(mask)) / mask.size
 
 
 # ---------------------------------------------------------------------------
-# Height estimation via trigonometry
+# Hedge band selection (separating the hedgerow from background trees)
+# ---------------------------------------------------------------------------
+def crop_to_hedge_band(image_bgr: np.ndarray, top_frac: float, bottom_frac: float) -> np.ndarray:
+    """
+    Crop the frame to the row band that contains the hedgerow itself.
+
+    A photo can show background trees/hedges rising above the hedgerow
+    being surveyed — same green color, so color thresholding alone cannot
+    tell them apart. There is no depth cue in a single 2D photo to separate
+    "this hedge" from "that hedge/tree behind it" automatically; the
+    surveyor marks the row band where the hedgerow being assessed actually
+    sits (e.g. top_frac=0.25 to exclude the top quarter of the frame if
+    that's background trees), and only that band feeds porosity/height.
+    """
+    height_px = image_bgr.shape[0]
+    top_row = max(0, min(height_px, int(round(top_frac * height_px))))
+    bottom_row = max(top_row, min(height_px, int(round(bottom_frac * height_px))))
+    return image_bgr[top_row:bottom_row, :]
+
+
+# ---------------------------------------------------------------------------
+# Height estimation
 # ---------------------------------------------------------------------------
 def find_hedge_top_row(mask: np.ndarray) -> int:
     """
-    Median row index of the topmost non-sky pixel in each column.
+    Median row index of the topmost non-gap pixel in each column, within
+    whatever band of the frame the mask covers.
 
     Using the median (rather than the single highest point) avoids letting
-    an isolated tree or a spike in the mask dominate the height estimate.
-
-    Requires open sky visible above the hedge crown within the frame. A
-    photo shot with background trees/hedges rising above the frame top
-    (e.g. hedgerow-trim-16896461364.jpg) has no sky boundary to find, so
-    this returns row 0 for most/all columns and the height estimate is
-    meaningless — the capture composition, not the threshold tuning, is
-    the limiting factor there.
+    a spike in the mask dominate the height estimate. Run this on a mask
+    from crop_to_hedge_band, not the full frame, when background trees are
+    present — otherwise the topmost non-gap pixel is background canopy, not
+    the hedgerow's own top edge.
     """
     foliage = ~mask
     top_rows = []
@@ -122,12 +158,43 @@ def estimate_height_m(
     axis proportional to its offset from the frame's vertical center, offset
     by the camera's tilt, and converted to a vertical rise over the known
     horizontal distance.
+
+    Requires an accurate distance/FOV estimate, which is often just guessed
+    in the field — see estimate_height_from_reference for a more reliable
+    alternative when a person or other known-height object is in frame.
     """
     frac_from_center = (frame_height_px / 2.0 - top_row) / (frame_height_px / 2.0)
     angle_from_axis_deg = frac_from_center * (vertical_fov_deg / 2.0)
     angle_above_horizontal_deg = tilt_deg + angle_from_axis_deg
     rise_m = distance_m * tan(radians(angle_above_horizontal_deg))
     return camera_height_m + rise_m
+
+
+def estimate_height_from_reference(
+    hedge_top_row_px: float,
+    hedge_base_row_px: float,
+    reference_top_row_px: float,
+    reference_base_row_px: float,
+    reference_height_m: float,
+) -> float:
+    """
+    Estimate hedge height by scaling against a reference object of known
+    height (typically a person standing at roughly the same distance from
+    the camera as the hedge). This avoids needing to guess distance/FOV
+    values in the field: pixel height of the reference object gives a
+    pixels-per-metre scale, which converts the hedge's own pixel height
+    directly to metres.
+
+    Assumes the reference object and the hedge face are at approximately
+    the same distance from the camera — if the person is standing well in
+    front of or behind the hedge, perspective will bias the result.
+    """
+    reference_height_px = abs(reference_base_row_px - reference_top_row_px)
+    if reference_height_px <= 0:
+        raise ValueError("Reference object must have positive pixel height")
+    px_per_metre = reference_height_px / reference_height_m
+    hedge_height_px = abs(hedge_base_row_px - hedge_top_row_px)
+    return hedge_height_px / px_per_metre
 
 
 # ---------------------------------------------------------------------------
@@ -162,8 +229,8 @@ class SectionGappinessResult:
 def _gap_run_lengths_m(mask: np.ndarray, image_length_m: float) -> list:
     """
     Column-wise gap run lengths (in metres) along the hedge, derived from a
-    sky/gap mask. A column counts as "gap" if the majority of pixels in a
-    vertical foliage band are sky/gap. Consecutive gap columns form a single
+    gap mask. A column counts as "gap" if the majority of pixels in a
+    vertical foliage band are gap. Consecutive gap columns form a single
     run, converted to metres by the image's along-hedge ground length.
     """
     width_px = mask.shape[1]
@@ -190,7 +257,7 @@ def analyze_image_for_section(
     image_bgr: np.ndarray, filename: str, image_length_m: float
 ) -> ImagePorosityResult:
     """Run porosity/gap-run detection on a single image within a section."""
-    mask = segment_sky_gap_mask(image_bgr)
+    mask = segment_gap_mask(image_bgr)
     porosity = optical_porosity_pct(mask)
     gap_runs = _gap_run_lengths_m(mask, image_length_m)
     return ImagePorosityResult(
@@ -279,40 +346,107 @@ def render_single_image_tab():
         "Hedge photo", type=["jpg", "jpeg", "png"], key="single_upload"
     )
 
-    col1, col2 = st.columns(2)
-    with col1:
-        distance_m = st.number_input("Distance to hedge (m)", value=5.0, min_value=0.1)
-        camera_height_m = st.number_input("Camera height (m)", value=1.5, min_value=0.0)
-    with col2:
-        tilt_deg = st.number_input("Camera tilt angle (deg, up +)", value=0.0)
-        vertical_fov_deg = st.number_input("Vertical field of view (deg)", value=55.0, min_value=1.0)
-
     if uploaded_file is None:
         return
 
     image_bgr = _load_image_bgr(uploaded_file)
-    mask = segment_sky_gap_mask(image_bgr)
-    porosity = optical_porosity_pct(mask)
-    top_row = find_hedge_top_row(mask)
-    height_m = estimate_height_m(
-        top_row, image_bgr.shape[0], distance_m, camera_height_m, tilt_deg, vertical_fov_deg
+    frame_height_px = image_bgr.shape[0]
+
+    st.markdown("**Hedge band** (exclude background trees/hedges rising above the frame)")
+    top_frac, bottom_frac = st.slider(
+        "Row band containing the hedgerow (% of frame height, top to bottom)",
+        min_value=0,
+        max_value=100,
+        value=(0, 100),
+        step=1,
+        key="hedge_band",
     )
+    hedge_band_bgr = crop_to_hedge_band(image_bgr, top_frac / 100.0, bottom_frac / 100.0)
+    band_top_row_px = int(round(top_frac / 100.0 * frame_height_px))
+
+    mask_full = segment_gap_mask(image_bgr)
+    mask_band = segment_gap_mask(hedge_band_bgr)
+    porosity = optical_porosity_pct(mask_band)
+    top_row_in_band = find_hedge_top_row(mask_band)
+    hedge_top_row_px = band_top_row_px + top_row_in_band
+    hedge_base_row_px = band_top_row_px + hedge_band_bgr.shape[0]
 
     overlay = image_bgr.copy()
-    overlay[mask] = (255, 0, 255)
+    overlay[mask_full] = (255, 0, 255)
     blended = cv2.addWeighted(image_bgr, 0.6, overlay, 0.4, 0)
+    cv2.rectangle(
+        blended, (0, band_top_row_px), (image_bgr.shape[1] - 1, hedge_base_row_px - 1), (0, 255, 255), 2
+    )
 
     img_col1, img_col2 = st.columns(2)
     with img_col1:
         st.image(cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB), caption="Original")
     with img_col2:
-        st.image(cv2.cvtColor(blended, cv2.COLOR_BGR2RGB), caption="Sky/gap mask overlay")
+        st.image(
+            cv2.cvtColor(blended, cv2.COLOR_BGR2RGB),
+            caption="Gap mask overlay (magenta) with hedge band (yellow box)",
+        )
+
+    st.markdown("**Height estimation method**")
+    height_method = st.radio(
+        "Method",
+        ["Reference object (recommended)", "Trigonometry (distance/FOV guess)"],
+        key="height_method",
+        label_visibility="collapsed",
+    )
+
+    if height_method == "Reference object (recommended)":
+        st.caption(
+            "Read pixel row numbers off the image above (top of image = row 0). "
+            "Mark the reference object's top and base, and the hedge's top and base "
+            "within the yellow hedge band."
+        )
+        ref_col1, ref_col2, ref_col3 = st.columns(3)
+        with ref_col1:
+            reference_height_m = st.number_input(
+                "Reference object height (m)", value=1.83, min_value=0.1,
+                help="e.g. a 6 ft (1.83 m) person standing at roughly the hedge's distance",
+            )
+        with ref_col2:
+            reference_top_row_px = st.number_input(
+                "Reference top row (px)", value=0, min_value=0, max_value=frame_height_px
+            )
+            reference_base_row_px = st.number_input(
+                "Reference base row (px)", value=frame_height_px, min_value=0, max_value=frame_height_px
+            )
+        with ref_col3:
+            hedge_top_row_input = st.number_input(
+                "Hedge top row (px)", value=hedge_top_row_px, min_value=0, max_value=frame_height_px
+            )
+            hedge_base_row_input = st.number_input(
+                "Hedge base row (px)", value=hedge_base_row_px, min_value=0, max_value=frame_height_px
+            )
+        try:
+            height_m = estimate_height_from_reference(
+                hedge_top_row_input, hedge_base_row_input,
+                reference_top_row_px, reference_base_row_px,
+                reference_height_m,
+            )
+        except ValueError as exc:
+            st.error(str(exc))
+            return
+    else:
+        col1, col2 = st.columns(2)
+        with col1:
+            distance_m = st.number_input("Distance to hedge (m)", value=5.0, min_value=0.1)
+            camera_height_m = st.number_input("Camera height (m)", value=1.5, min_value=0.0)
+        with col2:
+            tilt_deg = st.number_input("Camera tilt angle (deg, up +)", value=0.0)
+            vertical_fov_deg = st.number_input("Vertical field of view (deg)", value=55.0, min_value=1.0)
+        height_m = estimate_height_m(
+            top_row_in_band, hedge_band_bgr.shape[0], distance_m, camera_height_m, tilt_deg, vertical_fov_deg
+        )
 
     height_pass = height_m > A1_HEIGHT_THRESHOLD_M
     porosity_pass = porosity < B2_GAPPINESS_THRESHOLD_PCT
 
     st.metric("A1 — Estimated height (m)", f"{height_m:.2f}", delta="PASS" if height_pass else "FAIL")
-    st.metric("B2 — Optical porosity (%, single image)", f"{porosity:.1f}", delta="PASS" if porosity_pass else "FAIL")
+    st.metric("B2 — Optical porosity (%, single image, hedge band only)", f"{porosity:.1f}", delta="PASS" if porosity_pass else "FAIL")
     st.caption(
         "This single-image porosity figure is indicative only — B2 requires "
         "aggregation across the full 30 m section (see Section batch tab)."
