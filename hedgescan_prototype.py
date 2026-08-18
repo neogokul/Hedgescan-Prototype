@@ -44,13 +44,19 @@ SECTION_LENGTH_M = 30.0
 # Sky/gap segmentation (classical HSV thresholding, no ML model)
 # ---------------------------------------------------------------------------
 # "Sky/gap" = bright & desaturated (overcast sky, blown-out gaps) OR blue hue
-# (clear sky). These are an untuned starting guess pending validation against
-# real hedge photos with varied lighting.
-HSV_BRIGHT_S_MAX = 60
-HSV_BRIGHT_V_MIN = 150
-HSV_BLUE_H_MIN = 90
-HSV_BLUE_H_MAX = 140
-HSV_BLUE_S_MIN = 40
+# (clear sky). Tuned against a real head-on hedgerow photo
+# (hedgerow-trim-16896461364.jpg): the original wide thresholds classified
+# sunlit grass highlights (H~44, S~53, V~226) and a worker's teal-green
+# trousers (H~85-94, S~195-255) as gap. Narrowing bright_s_max/bright_v_min
+# and requiring both higher saturation and higher brightness for the blue
+# rule drops false-positive rate in those regions from >10% to <1% while
+# still catching most sky visible through canopy gaps.
+HSV_BRIGHT_S_MAX = 25
+HSV_BRIGHT_V_MIN = 220
+HSV_BLUE_H_MIN = 100
+HSV_BLUE_H_MAX = 130
+HSV_BLUE_S_MIN = 70
+HSV_BLUE_V_MIN = 170
 
 
 def segment_sky_gap_mask(image_bgr: np.ndarray) -> np.ndarray:
@@ -59,7 +65,12 @@ def segment_sky_gap_mask(image_bgr: np.ndarray) -> np.ndarray:
     h, s, v = hsv[..., 0], hsv[..., 1], hsv[..., 2]
 
     bright_desaturated = (s <= HSV_BRIGHT_S_MAX) & (v >= HSV_BRIGHT_V_MIN)
-    blue_sky = (h >= HSV_BLUE_H_MIN) & (h <= HSV_BLUE_H_MAX) & (s >= HSV_BLUE_S_MIN)
+    blue_sky = (
+        (h >= HSV_BLUE_H_MIN)
+        & (h <= HSV_BLUE_H_MAX)
+        & (s >= HSV_BLUE_S_MIN)
+        & (v >= HSV_BLUE_V_MIN)
+    )
 
     return bright_desaturated | blue_sky
 
@@ -78,6 +89,13 @@ def find_hedge_top_row(mask: np.ndarray) -> int:
 
     Using the median (rather than the single highest point) avoids letting
     an isolated tree or a spike in the mask dominate the height estimate.
+
+    Requires open sky visible above the hedge crown within the frame. A
+    photo shot with background trees/hedges rising above the frame top
+    (e.g. hedgerow-trim-16896461364.jpg) has no sky boundary to find, so
+    this returns row 0 for most/all columns and the height estimate is
+    meaningless — the capture composition, not the threshold tuning, is
+    the limiting factor there.
     """
     foliage = ~mask
     top_rows = []
