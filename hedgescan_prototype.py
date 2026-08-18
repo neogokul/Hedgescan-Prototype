@@ -68,11 +68,37 @@ HSV_BRANCH_SAT_MAX = 160
 HSV_BRANCH_VAL_MAX = 130
 HSV_SHADOW_VAL_MAX = 30
 
+# Non-hedge vegetation and people are not gaps either — a flower, a rose
+# bush, or a person standing in front of the hedge blocks the view of
+# whatever is behind them, same as foliage does; they just aren't hedge
+# material. Excluding them keeps them out of the porosity count instead of
+# miscounting them as an opening.
+# Tuned against hedgerow-yard-1689572455874.jpg and
+# planting-a-hedge-row-1689706733107.jpg: rose petals sampled at H~164-165,
+# S 53-163, V 191-210 (pink/magenta); an orange-leaved shrub sampled at
+# H~33-38, S~229-233, V~128-184 (vivid warm color, much more saturated than
+# the brown_branch range above, which is deliberately desaturated to avoid
+# swallowing exactly this kind of non-hedge shrub). Skin tone is approximated
+# with the standard H 0-20, S 30-150, V 80-235 heuristic range used broadly
+# in CV skin-detection work — an approximation, not verified against this
+# specific photo, since we don't sample identifiable people pixel-by-pixel.
+HSV_PINK_MAGENTA_HUE_MIN = 140
+HSV_PINK_MAGENTA_SAT_MIN = 40
+HSV_PINK_MAGENTA_VAL_MIN = 140
+HSV_VIVID_WARM_HUE_MAX = 40
+HSV_VIVID_WARM_SAT_MIN = 165
+HSV_SKIN_HUE_MAX = 20
+HSV_SKIN_SAT_MIN = 30
+HSV_SKIN_SAT_MAX = 150
+HSV_SKIN_VAL_MIN = 80
+HSV_SKIN_VAL_MAX = 235
+
 
 def segment_gap_mask(image_bgr: np.ndarray) -> np.ndarray:
     """
     Return a boolean mask, True where the pixel is classified as a gap
-    (anything that is not hedge foliage or branch/stem material).
+    (anything that is not hedge material, non-hedge vegetation, or a
+    person/skin-toned obstruction).
     """
     hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
     h, s, v = hsv[..., 0], hsv[..., 1], hsv[..., 2]
@@ -88,14 +114,56 @@ def segment_gap_mask(image_bgr: np.ndarray) -> np.ndarray:
         & (v <= HSV_BRANCH_VAL_MAX)
     )
     deep_shadow = v <= HSV_SHADOW_VAL_MAX
+    pink_magenta_flower = (
+        (h >= HSV_PINK_MAGENTA_HUE_MIN) & (s >= HSV_PINK_MAGENTA_SAT_MIN) & (v >= HSV_PINK_MAGENTA_VAL_MIN)
+    )
+    vivid_warm_flower = (h <= HSV_VIVID_WARM_HUE_MAX) & (s >= HSV_VIVID_WARM_SAT_MIN)
+    skin_tone = (
+        (h <= HSV_SKIN_HUE_MAX)
+        & (s >= HSV_SKIN_SAT_MIN)
+        & (s <= HSV_SKIN_SAT_MAX)
+        & (v >= HSV_SKIN_VAL_MIN)
+        & (v <= HSV_SKIN_VAL_MAX)
+    )
 
-    is_hedge_material = green_foliage | brown_branch | deep_shadow
-    return ~is_hedge_material
+    is_hedge_or_excluded = (
+        green_foliage | brown_branch | deep_shadow | pink_magenta_flower | vivid_warm_flower | skin_tone
+    )
+    return ~is_hedge_or_excluded
 
 
 def optical_porosity_pct(mask: np.ndarray) -> float:
     """Percentage of the frame classified as gap."""
     return 100.0 * float(np.count_nonzero(mask)) / mask.size
+
+
+def hedge_silhouette_porosity_pct(mask: np.ndarray) -> float:
+    """
+    Percentage of gap pixels, counted only within each column's hedge
+    silhouette (from its topmost to bottommost non-gap pixel) rather than
+    across the whole frame.
+
+    Open sky above the hedge crown, or grass/pavement below its base, is a
+    gap by color but isn't part of the hedge at all — it shouldn't inflate
+    porosity just because it's visible in the same photo. Restricting the
+    count to each column's own hedge extent excludes both automatically,
+    without needing a manual hedge-band crop for a hedge with a clean,
+    roughly horizontal top edge (crop_to_hedge_band is still the tool for a
+    hedge sharing columns with taller background trees/hedges).
+    """
+    foliage = ~mask
+    total_in_silhouette = 0
+    gap_in_silhouette = 0
+    for col in range(mask.shape[1]):
+        rows = np.flatnonzero(foliage[:, col])
+        if rows.size == 0:
+            continue
+        top, bottom = rows[0], rows[-1]
+        total_in_silhouette += bottom - top + 1
+        gap_in_silhouette += int(np.count_nonzero(mask[top : bottom + 1, col]))
+    if total_in_silhouette == 0:
+        return 0.0
+    return 100.0 * gap_in_silhouette / total_in_silhouette
 
 
 # ---------------------------------------------------------------------------
@@ -229,15 +297,28 @@ class SectionGappinessResult:
 def _gap_run_lengths_m(mask: np.ndarray, image_length_m: float) -> list:
     """
     Column-wise gap run lengths (in metres) along the hedge, derived from a
-    gap mask. A column counts as "gap" if the majority of pixels in a
-    vertical foliage band are gap. Consecutive gap columns form a single
-    run, converted to metres by the image's along-hedge ground length.
+    gap mask. A column counts as "gap" if the majority of pixels within
+    that column's own hedge silhouette (its topmost-to-bottommost non-gap
+    pixel) are gap, or if the column has no hedge material at all (a
+    genuine full-height opening straight through the hedge). Restricting to
+    the silhouette keeps open sky above the hedge crown, or ground below
+    its base, from padding out a column's gap fraction. Consecutive gap
+    columns form a single run, converted to metres by the image's
+    along-hedge ground length.
     """
     width_px = mask.shape[1]
     if width_px == 0:
         return []
 
-    column_is_gap = mask.mean(axis=0) > 0.5
+    foliage = ~mask
+    column_is_gap = np.zeros(width_px, dtype=bool)
+    for col in range(width_px):
+        rows = np.flatnonzero(foliage[:, col])
+        if rows.size == 0:
+            column_is_gap[col] = True  # no hedge material anywhere in this column
+        else:
+            top, bottom = rows[0], rows[-1]
+            column_is_gap[col] = mask[top : bottom + 1, col].mean() > 0.5
     m_per_px = image_length_m / width_px
 
     runs = []
@@ -258,7 +339,7 @@ def analyze_image_for_section(
 ) -> ImagePorosityResult:
     """Run porosity/gap-run detection on a single image within a section."""
     mask = segment_gap_mask(image_bgr)
-    porosity = optical_porosity_pct(mask)
+    porosity = hedge_silhouette_porosity_pct(mask)
     gap_runs = _gap_run_lengths_m(mask, image_length_m)
     return ImagePorosityResult(
         filename=filename, porosity_pct=porosity, gap_run_lengths_m=gap_runs
@@ -366,7 +447,7 @@ def render_single_image_tab():
 
     mask_full = segment_gap_mask(image_bgr)
     mask_band = segment_gap_mask(hedge_band_bgr)
-    porosity = optical_porosity_pct(mask_band)
+    porosity = hedge_silhouette_porosity_pct(mask_band)
     top_row_in_band = find_hedge_top_row(mask_band)
     hedge_top_row_px = band_top_row_px + top_row_in_band
     hedge_base_row_px = band_top_row_px + hedge_band_bgr.shape[0]
@@ -446,7 +527,7 @@ def render_single_image_tab():
     porosity_pass = porosity < B2_GAPPINESS_THRESHOLD_PCT
 
     st.metric("A1 — Estimated height (m)", f"{height_m:.2f}", delta="PASS" if height_pass else "FAIL")
-    st.metric("B2 — Optical porosity (%, single image, hedge band only)", f"{porosity:.1f}", delta="PASS" if porosity_pass else "FAIL")
+    st.metric("B2 — Optical porosity (%, single image, within hedge silhouette)", f"{porosity:.1f}", delta="PASS" if porosity_pass else "FAIL")
     st.caption(
         "This single-image porosity figure is indicative only — B2 requires "
         "aggregation across the full 30 m section (see Section batch tab)."
