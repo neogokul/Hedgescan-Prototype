@@ -445,6 +445,10 @@ def render_single_image_tab():
     hedge_band_bgr = crop_to_hedge_band(image_bgr, top_frac / 100.0, bottom_frac / 100.0)
     band_top_row_px = int(round(top_frac / 100.0 * frame_height_px))
 
+    if hedge_band_bgr.shape[0] == 0:
+        st.error("Hedge band is zero height — drag the two slider handles apart.")
+        return
+
     mask_full = segment_gap_mask(image_bgr)
     mask_band = segment_gap_mask(hedge_band_bgr)
     porosity = hedge_silhouette_porosity_pct(mask_band)
