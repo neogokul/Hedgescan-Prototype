@@ -25,12 +25,35 @@ Width, basal gap and damage are not yet implemented.
 """
 
 import io
+import json
 from dataclasses import dataclass, field
 from math import radians, tan
+from pathlib import Path
 
 import cv2
 import numpy as np
 import streamlit as st
+from PIL import Image
+import streamlit.elements.image as _st_image
+
+# streamlit-drawable-canvas 0.9.3 (last released 2022) calls
+# streamlit.elements.image.image_to_url, which newer Streamlit (this app
+# targets current Streamlit, not a pinned old one) moved to
+# streamlit.elements.lib.image_utils, and its signature changed from a
+# plain pixel-width int to a LayoutConfig object. Shim the old call shape
+# back in, rather than pin an old Streamlit just for this one dependency.
+if not hasattr(_st_image, "image_to_url"):
+    from streamlit.elements.lib.image_utils import image_to_url as _modern_image_to_url
+    from streamlit.elements.lib.layout_utils import LayoutConfig as _LayoutConfig
+
+    def _image_to_url_shim(image, width, clamp, channels, output_format, image_id):
+        return _modern_image_to_url(
+            image, _LayoutConfig(width=width), clamp, channels, output_format, image_id
+        )
+
+    _st_image.image_to_url = _image_to_url_shim
+
+from streamlit_drawable_canvas import st_canvas
 
 # ---------------------------------------------------------------------------
 # Defra Metric 4.0 structural thresholds
@@ -629,6 +652,166 @@ def render_section_batch_tab():
     )
 
 
+# ---------------------------------------------------------------------------
+# Labeling (build a corrected data pool from a folder of dataset images)
+# ---------------------------------------------------------------------------
+LABEL_DIR = Path("labels")
+LABEL_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png"}
+LABEL_CANVAS_DISPLAY_WIDTH = 650
+
+
+def _list_dataset_images(data_dir: Path) -> list:
+    """Images in data_dir, sorted numerically by stem when the stem is a number
+    (so 1.jpg, 2.jpg, ..., 100.jpg sort in the expected order), else by name."""
+    if not data_dir.is_dir():
+        return []
+
+    def sort_key(path):
+        try:
+            return (0, int(path.stem))
+        except ValueError:
+            return (1, path.stem)
+
+    return sorted(
+        (p for p in data_dir.iterdir() if p.suffix.lower() in LABEL_IMAGE_EXTENSIONS),
+        key=sort_key,
+    )
+
+
+def _circles_from_canvas_json(json_data, scale: float) -> list:
+    """Extract drawn circles from a streamlit-drawable-canvas result, converted
+    from displayed-canvas pixel coordinates back to original-image pixel
+    coordinates (canvas is shown scaled down to fit the page)."""
+    if not json_data:
+        return []
+    circles = []
+    for obj in json_data.get("objects", []):
+        if obj.get("type") != "circle":
+            continue
+        radius_px = obj.get("radius", 0) * obj.get("scaleX", 1)
+        cx = (obj.get("left", 0) + radius_px) / scale
+        cy = (obj.get("top", 0) + radius_px) / scale
+        circles.append({"cx": round(cx, 1), "cy": round(cy, 1), "r": round(radius_px / scale, 1)})
+    return circles
+
+
+def render_labeling_tab():
+    st.subheader("Labeling: correct the model's porosity calls")
+    st.caption(
+        "Step through a folder of dataset photos, see the current gap-mask "
+        "overlay, then circle where the model missed a real gap or wrongly "
+        "flagged one. Saved labels build a corrected data pool for evaluating "
+        "or tuning the classifier later — they don't change the live thresholds."
+    )
+
+    data_dir = Path(st.text_input("Dataset folder (relative to the app)", value="data"))
+    images = _list_dataset_images(data_dir)
+
+    image_bgr = None
+    image_name = None
+
+    if images:
+        LABEL_DIR.mkdir(exist_ok=True)
+        labeled_stems = {p.stem for p in LABEL_DIR.glob("*.json")}
+        st.caption(f"{len(labeled_stems)} / {len(images)} images labeled so far, saved under `{LABEL_DIR}/`.")
+
+        if "label_index" not in st.session_state:
+            st.session_state.label_index = 0
+        st.session_state.label_index = max(0, min(len(images) - 1, st.session_state.label_index))
+
+        nav1, nav2, nav3 = st.columns([1, 2, 1])
+        with nav1:
+            if st.button("< Previous", disabled=st.session_state.label_index == 0):
+                st.session_state.label_index -= 1
+        with nav3:
+            if st.button("Next >", disabled=st.session_state.label_index >= len(images) - 1):
+                st.session_state.label_index += 1
+        with nav2:
+            st.session_state.label_index = st.number_input(
+                "Image index",
+                min_value=0,
+                max_value=len(images) - 1,
+                value=st.session_state.label_index,
+                step=1,
+                label_visibility="collapsed",
+            )
+
+        image_path = images[st.session_state.label_index]
+        image_name = image_path.name
+        status = "already labeled" if image_path.stem in labeled_stems else "not yet labeled"
+        st.markdown(f"**{image_name}** ({st.session_state.label_index + 1} / {len(images)}) — {status}")
+        image_bgr = cv2.imread(str(image_path))
+    else:
+        st.info(
+            f"No images found in `{data_dir}/`. Point this at a folder of photos "
+            "(e.g. named 1.jpg .. 100.jpg), or upload one below to label it "
+            "standalone."
+        )
+        uploaded = st.file_uploader("Or upload a single photo", type=["jpg", "jpeg", "png"], key="label_upload")
+        if uploaded is not None:
+            image_bgr = _load_image_bgr(uploaded)
+            image_name = uploaded.name
+
+    if image_bgr is None:
+        return
+
+    mask = segment_gap_mask(image_bgr)
+    overlay = image_bgr.copy()
+    overlay[mask] = (255, 0, 255)
+    blended_rgb = cv2.cvtColor(cv2.addWeighted(image_bgr, 0.6, overlay, 0.4, 0), cv2.COLOR_BGR2RGB)
+
+    orig_h, orig_w = blended_rgb.shape[:2]
+    scale = LABEL_CANVAS_DISPLAY_WIDTH / orig_w
+    display_h = int(round(orig_h * scale))
+    pil_bg = Image.fromarray(blended_rgb).resize((LABEL_CANVAS_DISPLAY_WIDTH, display_h))
+
+    st.markdown(
+        "Magenta = model says gap. Draw a circle over each mistake: **red** "
+        "where a real gap was missed, **cyan** where a gap was wrongly flagged."
+    )
+
+    canvas_col1, canvas_col2 = st.columns(2)
+    with canvas_col1:
+        st.markdown("**Missed porosity** — should be a gap, wasn't marked")
+        missed_canvas = st_canvas(
+            fill_color="rgba(255,0,0,0.25)",
+            stroke_width=3,
+            stroke_color="red",
+            background_image=pil_bg,
+            height=display_h,
+            width=LABEL_CANVAS_DISPLAY_WIDTH,
+            drawing_mode="circle",
+            key=f"missed_canvas_{image_name}",
+        )
+    with canvas_col2:
+        st.markdown("**Mistaken porosity** — wrongly marked as a gap")
+        mistaken_canvas = st_canvas(
+            fill_color="rgba(0,255,255,0.25)",
+            stroke_width=3,
+            stroke_color="cyan",
+            background_image=pil_bg,
+            height=display_h,
+            width=LABEL_CANVAS_DISPLAY_WIDTH,
+            drawing_mode="circle",
+            key=f"mistaken_canvas_{image_name}",
+        )
+
+    if st.button("Save labels for this image", type="primary"):
+        LABEL_DIR.mkdir(exist_ok=True)
+        record = {
+            "image": image_name,
+            "model_porosity_pct": round(hedge_silhouette_porosity_pct(mask), 2),
+            "missed_porosity": _circles_from_canvas_json(missed_canvas.json_data, scale),
+            "mistaken_porosity": _circles_from_canvas_json(mistaken_canvas.json_data, scale),
+        }
+        out_path = LABEL_DIR / f"{Path(image_name).stem}.json"
+        out_path.write_text(json.dumps(record, indent=2))
+        st.success(
+            f"Saved {len(record['missed_porosity'])} missed + "
+            f"{len(record['mistaken_porosity'])} mistaken marks to {out_path}"
+        )
+
+
 def main():
     st.set_page_config(page_title="HedgeScan Phase 0 Prototype", layout="wide")
     st.title("HedgeScan — Phase 0 Vision Prototype")
@@ -638,11 +821,13 @@ def main():
         "Not the mobile app."
     )
 
-    tab1, tab2 = st.tabs(["Single image", "Section batch"])
+    tab1, tab2, tab3 = st.tabs(["Single image", "Section batch", "Labeling"])
     with tab1:
         render_single_image_tab()
     with tab2:
         render_section_batch_tab()
+    with tab3:
+        render_labeling_tab()
 
 
 if __name__ == "__main__":
