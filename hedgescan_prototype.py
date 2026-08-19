@@ -132,6 +132,32 @@ def segment_gap_mask(image_bgr: np.ndarray) -> np.ndarray:
     return ~is_hedge_or_excluded
 
 
+def skin_tone_fraction_pct(image_bgr: np.ndarray) -> float:
+    """
+    Percentage of the frame that is skin-toned.
+
+    Skin tone is excluded from the gap mask (a person standing in front of
+    the hedge isn't an opening), but that means a frame dominated by
+    people rather than hedge would score close to 0% porosity — a
+    misleadingly "perfect" hedge, not a real measurement. Surfacing this
+    fraction lets the UI warn when that's likely what happened, rather
+    than silently reporting a clean pass.
+    """
+    hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
+    h, s, v = hsv[..., 0], hsv[..., 1], hsv[..., 2]
+    skin_tone = (
+        (h <= HSV_SKIN_HUE_MAX)
+        & (s >= HSV_SKIN_SAT_MIN)
+        & (s <= HSV_SKIN_SAT_MAX)
+        & (v >= HSV_SKIN_VAL_MIN)
+        & (v <= HSV_SKIN_VAL_MAX)
+    )
+    return 100.0 * float(np.count_nonzero(skin_tone)) / skin_tone.size
+
+
+SKIN_DOMINANT_WARNING_PCT = 15.0
+
+
 def optical_porosity_pct(mask: np.ndarray) -> float:
     """Percentage of the frame classified as gap."""
     return 100.0 * float(np.count_nonzero(mask)) / mask.size
@@ -231,6 +257,10 @@ def estimate_height_m(
     in the field — see estimate_height_from_reference for a more reliable
     alternative when a person or other known-height object is in frame.
     """
+    if not 0 <= top_row <= frame_height_px:
+        raise ValueError(
+            f"top_row ({top_row}) is outside the frame (0-{frame_height_px})"
+        )
     frac_from_center = (frame_height_px / 2.0 - top_row) / (frame_height_px / 2.0)
     angle_from_axis_deg = frac_from_center * (vertical_fov_deg / 2.0)
     angle_above_horizontal_deg = tilt_deg + angle_from_axis_deg
@@ -536,6 +566,16 @@ def render_single_image_tab():
         "This single-image porosity figure is indicative only — B2 requires "
         "aggregation across the full 30 m section (see Section batch tab)."
     )
+
+    skin_pct = skin_tone_fraction_pct(hedge_band_bgr)
+    if skin_pct >= SKIN_DOMINANT_WARNING_PCT:
+        st.warning(
+            f"{skin_pct:.0f}% of the hedge band is skin-toned. Skin is excluded from "
+            "the gap count (a person isn't an opening), but a frame this dominated by "
+            "a person means little hedge is actually visible — porosity here may be "
+            "understated rather than genuinely low. Narrow the hedge band or use a "
+            "photo with less of the person in frame."
+        )
 
 
 def render_section_batch_tab():
