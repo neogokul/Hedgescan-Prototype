@@ -834,6 +834,17 @@ def _classification_rgb(hedge_mask: np.ndarray) -> np.ndarray:
     return rgb
 
 
+def _classification_overlay_rgb(image_rgb: np.ndarray, hedge_mask: np.ndarray, alpha: float = 0.5) -> np.ndarray:
+    """
+    Green/red classification blended over the photo at `alpha` opacity, so
+    the photo underneath stays visible while painting corrections — a flat
+    color fill hides exactly the detail you need to see to know where to
+    paint.
+    """
+    flat = _classification_rgb(hedge_mask)
+    return cv2.addWeighted(image_rgb, 1 - alpha, flat, alpha, 0)
+
+
 def _apply_canvas_corrections(base_label_grid: np.ndarray, image_data) -> np.ndarray:
     """
     Overlay user-painted corrections onto the model's label grid.
@@ -978,11 +989,17 @@ def render_pixel_annotation_tab():
         hedge_mask_full.astype(np.uint8), (ANNOTATION_CANVAS_DISPLAY_WIDTH, display_h), interpolation=cv2.INTER_NEAREST
     ).astype(bool)
 
+    image_rgb_full = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+    image_rgb_display = cv2.resize(image_rgb_full, (ANNOTATION_CANVAS_DISPLAY_WIDTH, display_h))
+
     img_col1, img_col2 = st.columns(2)
     with img_col1:
-        st.image(cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB), caption="Original")
+        st.image(image_rgb_full, caption="Original")
     with img_col2:
-        st.image(_classification_rgb(hedge_mask_full), caption="System's current call — green = hedge, red = everything else")
+        st.image(
+            _classification_overlay_rgb(image_rgb_full, hedge_mask_full),
+            caption="System's current call — green = hedge, red = everything else (50% opacity, photo underneath)",
+        )
 
     st.markdown(
         "Paint corrections directly on the canvas below: pick a color, set a "
@@ -995,7 +1012,7 @@ def render_pixel_annotation_tab():
         brush_size = st.slider("Brush size", min_value=2, max_value=60, value=15, key="anno_brush_size")
     stroke_color = "rgb(0,200,0)" if paint_label.startswith("Hedge") else "rgb(220,30,30)"
 
-    pil_bg = Image.fromarray(_classification_rgb(hedge_mask_display))
+    pil_bg = Image.fromarray(_classification_overlay_rgb(image_rgb_display, hedge_mask_display))
     canvas_result = st_canvas(
         fill_color=stroke_color,
         stroke_width=brush_size,
