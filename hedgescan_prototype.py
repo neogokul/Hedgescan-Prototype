@@ -812,6 +812,211 @@ def render_labeling_tab():
         )
 
 
+# ---------------------------------------------------------------------------
+# Pixel annotation (full hedge/not-hedge mask correction -> annotation_data/)
+# ---------------------------------------------------------------------------
+ANNOTATION_DIR = Path("annotation_data")
+ANNOTATION_CANVAS_DISPLAY_WIDTH = 650
+ANNOTATION_HEDGE_COLOR = (0, 200, 0)      # green, displayed RGB
+ANNOTATION_NOT_HEDGE_COLOR = (220, 30, 30)  # red, displayed RGB
+
+
+def _hedge_material_mask(image_bgr: np.ndarray) -> np.ndarray:
+    """True where the current classifier calls a pixel hedge material (not a gap)."""
+    return ~segment_gap_mask(image_bgr)
+
+
+def _classification_rgb(hedge_mask: np.ndarray) -> np.ndarray:
+    """Flat green/red visualization of a hedge/not-hedge label grid."""
+    rgb = np.empty((*hedge_mask.shape, 3), dtype=np.uint8)
+    rgb[hedge_mask] = ANNOTATION_HEDGE_COLOR
+    rgb[~hedge_mask] = ANNOTATION_NOT_HEDGE_COLOR
+    return rgb
+
+
+def _apply_canvas_corrections(base_label_grid: np.ndarray, image_data) -> np.ndarray:
+    """
+    Overlay user-painted corrections onto the model's label grid.
+
+    image_data is the canvas's RGBA drawing layer at canvas (display)
+    resolution — transparent (alpha=0) wherever nothing was painted, so
+    those pixels keep the model's original call; painted pixels (alpha>0)
+    are relabeled hedge/not-hedge by whichever of red/green is stronger.
+    """
+    label_grid = base_label_grid.copy()
+    if image_data is None:
+        return label_grid
+    alpha = image_data[..., 3]
+    painted = alpha > 0
+    if not np.any(painted):
+        return label_grid
+    red = image_data[..., 0].astype(int)
+    green = image_data[..., 1].astype(int)
+    painted_hedge = painted & (green > red)
+    painted_not_hedge = painted & (red >= green)
+    label_grid[painted_hedge] = True
+    label_grid[painted_not_hedge] = False
+    return label_grid
+
+
+def _label_grid_to_rle_lines(label_grid: np.ndarray) -> list:
+    """Row-major run-length encoding: one line per row, 'label:count,label:count,...'."""
+    lines = []
+    for row in label_grid:
+        runs = []
+        current = bool(row[0])
+        count = 0
+        for value in row:
+            value = bool(value)
+            if value == current:
+                count += 1
+            else:
+                runs.append(f"{int(current)}:{count}")
+                current = value
+                count = 1
+        runs.append(f"{int(current)}:{count}")
+        lines.append(",".join(runs))
+    return lines
+
+
+def save_annotation_text(image_name: str, label_grid: np.ndarray) -> Path:
+    """
+    Write a full-resolution hedge/not-hedge annotation as run-length-encoded
+    text: a small header (image name, width, height) followed by one RLE
+    line per image row. 1 = hedge material, 0 = not hedge (gap, other
+    vegetation, person, background, etc). See rle_lines_to_label_grid for
+    the matching reader.
+    """
+    ANNOTATION_DIR.mkdir(exist_ok=True)
+    height, width = label_grid.shape
+    lines = [
+        f"image: {image_name}",
+        f"width: {width}",
+        f"height: {height}",
+        "# 1=hedge material, 0=not hedge; each line below is one row, run-length encoded",
+    ]
+    lines.extend(_label_grid_to_rle_lines(label_grid))
+    out_path = ANNOTATION_DIR / f"{Path(image_name).stem}.txt"
+    out_path.write_text("\n".join(lines) + "\n")
+    return out_path
+
+
+def rle_lines_to_label_grid(text: str) -> np.ndarray:
+    """Inverse of save_annotation_text's RLE body, for reading annotations back."""
+    lines = text.splitlines()
+    meta = {}
+    body_start = 0
+    for i, line in enumerate(lines):
+        if line.startswith("width:"):
+            meta["width"] = int(line.split(":")[1])
+        elif line.startswith("height:"):
+            meta["height"] = int(line.split(":")[1])
+        elif not line.startswith("image:") and not line.startswith("#"):
+            body_start = i
+            break
+    grid = np.zeros((meta["height"], meta["width"]), dtype=bool)
+    for row_index, line in enumerate(lines[body_start : body_start + meta["height"]]):
+        col = 0
+        for run in line.split(","):
+            label, count = run.split(":")
+            count = int(count)
+            if label == "1":
+                grid[row_index, col : col + count] = True
+            col += count
+    return grid
+
+
+def render_pixel_annotation_tab():
+    st.subheader("Pixel annotation: repaint hedgerow vs. everything else")
+    st.caption(
+        "The system marks what it currently thinks is hedge material in "
+        "green and everything else (gaps, other trees, flowers, people, "
+        "background) in red. Paint over its mistakes, then save — the "
+        "corrected full mask is written to `annotation_data/` as a text "
+        "file, one per photo."
+    )
+
+    data_dir = Path(st.text_input("Dataset folder (relative to the app)", value="Dataset", key="anno_data_dir"))
+    images = _list_dataset_images(data_dir)
+    if not images:
+        st.info(f"No images found in `{data_dir}/`. Point this at the folder holding 1.jpg .. 19.jpg.")
+        return
+
+    ANNOTATION_DIR.mkdir(exist_ok=True)
+    annotated_stems = {p.stem for p in ANNOTATION_DIR.glob("*.txt")}
+    st.caption(f"{len(annotated_stems)} / {len(images)} images annotated so far, saved under `{ANNOTATION_DIR}/`.")
+
+    if "anno_index" not in st.session_state:
+        st.session_state.anno_index = 0
+    st.session_state.anno_index = max(0, min(len(images) - 1, st.session_state.anno_index))
+
+    nav1, nav2, nav3 = st.columns([1, 2, 1])
+    with nav1:
+        if st.button("< Previous", disabled=st.session_state.anno_index == 0, key="anno_prev"):
+            st.session_state.anno_index -= 1
+    with nav3:
+        if st.button("Next >", disabled=st.session_state.anno_index >= len(images) - 1, key="anno_next"):
+            st.session_state.anno_index += 1
+    with nav2:
+        st.session_state.anno_index = st.number_input(
+            "Image index", min_value=0, max_value=len(images) - 1,
+            value=st.session_state.anno_index, step=1, label_visibility="collapsed", key="anno_index_input",
+        )
+
+    image_path = images[st.session_state.anno_index]
+    image_name = image_path.name
+    status = "already annotated" if image_path.stem in annotated_stems else "not yet annotated"
+    st.markdown(f"**{image_name}** ({st.session_state.anno_index + 1} / {len(images)}) — {status}")
+
+    image_bgr = cv2.imread(str(image_path))
+    orig_h, orig_w = image_bgr.shape[:2]
+    hedge_mask_full = _hedge_material_mask(image_bgr)
+
+    scale = ANNOTATION_CANVAS_DISPLAY_WIDTH / orig_w
+    display_h = int(round(orig_h * scale))
+    hedge_mask_display = cv2.resize(
+        hedge_mask_full.astype(np.uint8), (ANNOTATION_CANVAS_DISPLAY_WIDTH, display_h), interpolation=cv2.INTER_NEAREST
+    ).astype(bool)
+
+    img_col1, img_col2 = st.columns(2)
+    with img_col1:
+        st.image(cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB), caption="Original")
+    with img_col2:
+        st.image(_classification_rgb(hedge_mask_full), caption="System's current call — green = hedge, red = everything else")
+
+    st.markdown(
+        "Paint corrections directly on the canvas below: pick a color, set a "
+        "brush size, and repaint any area the system got wrong."
+    )
+    paint_col1, paint_col2 = st.columns(2)
+    with paint_col1:
+        paint_label = st.radio("Brush", ["Hedge (green)", "Not hedge (red)"], key="anno_brush", horizontal=True)
+    with paint_col2:
+        brush_size = st.slider("Brush size", min_value=2, max_value=60, value=15, key="anno_brush_size")
+    stroke_color = "rgb(0,200,0)" if paint_label.startswith("Hedge") else "rgb(220,30,30)"
+
+    pil_bg = Image.fromarray(_classification_rgb(hedge_mask_display))
+    canvas_result = st_canvas(
+        fill_color=stroke_color,
+        stroke_width=brush_size,
+        stroke_color=stroke_color,
+        background_image=pil_bg,
+        height=display_h,
+        width=ANNOTATION_CANVAS_DISPLAY_WIDTH,
+        drawing_mode="freedraw",
+        key=f"anno_canvas_{image_name}",
+    )
+
+    if st.button("Save annotation for this image", type="primary"):
+        corrected_display = _apply_canvas_corrections(hedge_mask_display, canvas_result.image_data)
+        corrected_full = cv2.resize(
+            corrected_display.astype(np.uint8), (orig_w, orig_h), interpolation=cv2.INTER_NEAREST
+        ).astype(bool)
+        out_path = save_annotation_text(image_name, corrected_full)
+        corrected_pct = 100.0 * np.count_nonzero(corrected_display != hedge_mask_display) / hedge_mask_display.size
+        st.success(f"Saved to {out_path} — {corrected_pct:.1f}% of the canvas was repainted from the model's call.")
+
+
 def main():
     st.set_page_config(page_title="HedgeScan Phase 0 Prototype", layout="wide")
     st.title("HedgeScan — Phase 0 Vision Prototype")
@@ -821,13 +1026,15 @@ def main():
         "Not the mobile app."
     )
 
-    tab1, tab2, tab3 = st.tabs(["Single image", "Section batch", "Labeling"])
+    tab1, tab2, tab3, tab4 = st.tabs(["Single image", "Section batch", "Labeling", "Pixel annotation"])
     with tab1:
         render_single_image_tab()
     with tab2:
         render_section_batch_tab()
     with tab3:
         render_labeling_tab()
+    with tab4:
+        render_pixel_annotation_tab()
 
 
 if __name__ == "__main__":
