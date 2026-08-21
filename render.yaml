@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: hedgescan-annotation
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: streamlit run hedgescan_prototype.py --server.port $PORT --server.address 0.0.0.0
+    envVars:
+      - key: GITHUB_TOKEN
+        sync: false
+      - key: GITHUB_REPO
+        value: neogokul/Hedgescan-Prototype
+      - key: GITHUB_ANNOTATION_BRANCH
+        value: annotation-data

@@ -890,16 +890,15 @@ def _label_grid_to_rle_lines(label_grid: np.ndarray) -> list:
     return lines
 
 
-def save_annotation_text(image_name: str, label_grid: np.ndarray) -> Path:
+def annotation_text(image_name: str, label_grid: np.ndarray) -> str:
     """
-    Write a full-resolution hedge/not-hedge annotation as run-length-encoded
+    Render a full-resolution hedge/not-hedge annotation as run-length-encoded
     text: a small header (image name, width, height) followed by one RLE
     line per image row. 1 = the specific hedgerow being surveyed, 0 =
     anything else (gap, other trees/vegetation, grass, flowers, person,
     background, etc) — a human judgement call, not the raw classifier
     output. See rle_lines_to_label_grid for the matching reader.
     """
-    ANNOTATION_DIR.mkdir(exist_ok=True)
     height, width = label_grid.shape
     lines = [
         f"image: {image_name}",
@@ -908,9 +907,141 @@ def save_annotation_text(image_name: str, label_grid: np.ndarray) -> Path:
         "# 1=the surveyed hedgerow, 0=everything else; each line below is one row, run-length encoded",
     ]
     lines.extend(_label_grid_to_rle_lines(label_grid))
+    return "\n".join(lines) + "\n"
+
+
+def save_annotation_text(image_name: str, label_grid: np.ndarray) -> Path:
+    """Write annotation_text's output to annotation_data/<name>.txt on local disk."""
+    ANNOTATION_DIR.mkdir(exist_ok=True)
     out_path = ANNOTATION_DIR / f"{Path(image_name).stem}.txt"
-    out_path.write_text("\n".join(lines) + "\n")
+    out_path.write_text(annotation_text(image_name, label_grid))
     return out_path
+
+
+# ---------------------------------------------------------------------------
+# Push annotations straight to GitHub (for a hosted, multi-annotator setup)
+# ---------------------------------------------------------------------------
+# A hosted instance (e.g. Render) has no reliably persistent disk and no git
+# credentials by default, so "write to local disk" doesn't get an annotator's
+# work back to us. Writing directly through the GitHub Contents API sidesteps
+# both problems: no local git state to keep consistent, just one authenticated
+# HTTP call per save. Configured via three env vars (unset = feature off,
+# falls back to the local-disk save above):
+#   GITHUB_TOKEN            - fine-grained PAT scoped to this repo, contents:write
+#   GITHUB_REPO             - "owner/repo", e.g. "neogokul/Hedgescan-Prototype"
+#   GITHUB_ANNOTATION_BRANCH - defaults to "annotation-data"
+import os
+
+
+def github_push_configured() -> bool:
+    return bool(os.environ.get("GITHUB_TOKEN") and os.environ.get("GITHUB_REPO"))
+
+
+def push_annotation_to_github(image_name: str, label_grid: np.ndarray) -> str:
+    """
+    Create or update annotation_data/<name>.txt on the configured GitHub
+    branch via the Contents API, and return the commit's HTML URL.
+    Raises RuntimeError with a readable message on any failure (missing
+    config, bad token, network error, API error) — callers should catch
+    this and fall back to save_annotation_text rather than lose the work.
+    """
+    import base64
+
+    import requests
+
+    token = os.environ.get("GITHUB_TOKEN")
+    repo = os.environ.get("GITHUB_REPO")
+    branch = os.environ.get("GITHUB_ANNOTATION_BRANCH", "annotation-data")
+    if not token or not repo:
+        raise RuntimeError("GITHUB_TOKEN / GITHUB_REPO not configured")
+
+    path = f"annotation_data/{Path(image_name).stem}.txt"
+    api_url = f"https://api.github.com/repos/{repo}/contents/{path}"
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
+
+    existing = requests.get(api_url, headers=headers, params={"ref": branch}, timeout=15)
+    if existing.status_code not in (200, 404):
+        raise RuntimeError(f"GitHub GET failed ({existing.status_code}): {existing.text[:200]}")
+    sha = existing.json().get("sha") if existing.status_code == 200 else None
+
+    content = annotation_text(image_name, label_grid)
+    payload = {
+        "message": f"Annotate {image_name}",
+        "content": base64.b64encode(content.encode("utf-8")).decode("ascii"),
+        "branch": branch,
+    }
+    if sha:
+        payload["sha"] = sha
+
+    response = requests.put(api_url, headers=headers, json=payload, timeout=15)
+    if response.status_code not in (200, 201):
+        raise RuntimeError(f"GitHub PUT failed ({response.status_code}): {response.text[:200]}")
+    return response.json().get("commit", {}).get("html_url", "")
+
+
+@st.cache_data(ttl=3600, show_spinner="Fetching dataset photo list from GitHub...")
+def _list_github_dataset_images(repo: str, branch: str) -> list:
+    """Filenames of images on the given branch's root, GitHub-sorted (same
+    numeric-aware order as _list_dataset_images), via the Contents API."""
+    import requests
+
+    headers = {"Accept": "application/vnd.github+json"}
+    if os.environ.get("GITHUB_TOKEN"):
+        headers["Authorization"] = f"Bearer {os.environ['GITHUB_TOKEN']}"
+    response = requests.get(
+        f"https://api.github.com/repos/{repo}/contents/", headers=headers, params={"ref": branch}, timeout=15
+    )
+    if response.status_code != 200:
+        raise RuntimeError(f"GitHub listing failed ({response.status_code}): {response.text[:200]}")
+    names = [
+        item["name"] for item in response.json()
+        if Path(item["name"]).suffix.lower() in LABEL_IMAGE_EXTENSIONS
+    ]
+
+    def sort_key(name):
+        try:
+            return (0, int(Path(name).stem))
+        except ValueError:
+            return (1, name)
+
+    return sorted(names, key=sort_key)
+
+
+@st.cache_data(ttl=3600, show_spinner="Downloading photo from GitHub...")
+def _load_github_dataset_image(repo: str, branch: str, name: str) -> np.ndarray:
+    """Download one image by name from the dataset branch and decode it."""
+    import requests
+
+    headers = {"Accept": "application/vnd.github.raw+json"}
+    if os.environ.get("GITHUB_TOKEN"):
+        headers["Authorization"] = f"Bearer {os.environ['GITHUB_TOKEN']}"
+    response = requests.get(
+        f"https://api.github.com/repos/{repo}/contents/{name}", headers=headers, params={"ref": branch}, timeout=30
+    )
+    if response.status_code != 200:
+        raise RuntimeError(f"GitHub download of {name} failed ({response.status_code}): {response.text[:200]}")
+    file_bytes = np.frombuffer(response.content, np.uint8)
+    return cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+
+
+def _dataset_image_source(data_dir: Path):
+    """
+    Return (image_names, load_fn) for the dataset, preferring a local folder
+    (data_dir) when it has images, falling back to the GITHUB_DATASET_BRANCH
+    branch of GITHUB_REPO via the API when it's empty — the local folder
+    won't exist on a hosted instance whose deploy branch doesn't include the
+    dataset photos (they live on a separate branch, e.g. `Dataset`).
+    """
+    local_images = _list_dataset_images(data_dir)
+    if local_images:
+        return [p.name for p in local_images], (lambda name: cv2.imread(str(data_dir / name)))
+
+    repo = os.environ.get("GITHUB_REPO")
+    branch = os.environ.get("GITHUB_DATASET_BRANCH", "Dataset")
+    if not repo:
+        return [], None
+    names = _list_github_dataset_images(repo, branch)
+    return names, (lambda name: _load_github_dataset_image(repo, branch, name))
 
 
 def rle_lines_to_label_grid(text: str) -> np.ndarray:
@@ -955,38 +1086,45 @@ def render_pixel_annotation_tab():
     )
 
     data_dir = Path(st.text_input("Dataset folder (relative to the app)", value="Dataset", key="anno_data_dir"))
-    images = _list_dataset_images(data_dir)
-    if not images:
-        st.info(f"No images found in `{data_dir}/`. Point this at the folder holding 1.jpg .. 19.jpg.")
+    try:
+        image_names, load_image = _dataset_image_source(data_dir)
+    except RuntimeError as exc:
+        st.error(f"Could not list dataset photos from GitHub: {exc}")
+        return
+    if not image_names:
+        st.info(
+            f"No images found in `{data_dir}/`, and no GITHUB_REPO configured to fall "
+            "back to. Point the folder at 1.jpg .. 19.jpg, or set GITHUB_REPO / "
+            "GITHUB_DATASET_BRANCH so this can fetch them from GitHub instead."
+        )
         return
 
     ANNOTATION_DIR.mkdir(exist_ok=True)
     annotated_stems = {p.stem for p in ANNOTATION_DIR.glob("*.txt")}
-    st.caption(f"{len(annotated_stems)} / {len(images)} images annotated so far, saved under `{ANNOTATION_DIR}/`.")
+    st.caption(f"{len(annotated_stems)} / {len(image_names)} images annotated so far, saved under `{ANNOTATION_DIR}/`.")
 
     if "anno_index" not in st.session_state:
         st.session_state.anno_index = 0
-    st.session_state.anno_index = max(0, min(len(images) - 1, st.session_state.anno_index))
+    st.session_state.anno_index = max(0, min(len(image_names) - 1, st.session_state.anno_index))
 
     nav1, nav2, nav3 = st.columns([1, 2, 1])
     with nav1:
         if st.button("< Previous", disabled=st.session_state.anno_index == 0, key="anno_prev"):
             st.session_state.anno_index -= 1
     with nav3:
-        if st.button("Next >", disabled=st.session_state.anno_index >= len(images) - 1, key="anno_next"):
+        if st.button("Next >", disabled=st.session_state.anno_index >= len(image_names) - 1, key="anno_next"):
             st.session_state.anno_index += 1
     with nav2:
         st.session_state.anno_index = st.number_input(
-            "Image index", min_value=0, max_value=len(images) - 1,
+            "Image index", min_value=0, max_value=len(image_names) - 1,
             value=st.session_state.anno_index, step=1, label_visibility="collapsed", key="anno_index_input",
         )
 
-    image_path = images[st.session_state.anno_index]
-    image_name = image_path.name
-    status = "already annotated" if image_path.stem in annotated_stems else "not yet annotated"
-    st.markdown(f"**{image_name}** ({st.session_state.anno_index + 1} / {len(images)}) — {status}")
+    image_name = image_names[st.session_state.anno_index]
+    status = "already annotated" if Path(image_name).stem in annotated_stems else "not yet annotated"
+    st.markdown(f"**{image_name}** ({st.session_state.anno_index + 1} / {len(image_names)}) — {status}")
 
-    image_bgr = cv2.imread(str(image_path))
+    image_bgr = load_image(image_name)
     orig_h, orig_w = image_bgr.shape[:2]
     hedge_mask_full = _hedge_material_mask(image_bgr)
 
@@ -1031,14 +1169,40 @@ def render_pixel_annotation_tab():
         key=f"anno_canvas_{image_name}",
     )
 
-    if st.button("Save annotation for this image", type="primary"):
-        corrected_display = _apply_canvas_corrections(hedge_mask_display, canvas_result.image_data)
-        corrected_full = cv2.resize(
-            corrected_display.astype(np.uint8), (orig_w, orig_h), interpolation=cv2.INTER_NEAREST
-        ).astype(bool)
-        out_path = save_annotation_text(image_name, corrected_full)
-        corrected_pct = 100.0 * np.count_nonzero(corrected_display != hedge_mask_display) / hedge_mask_display.size
-        st.success(f"Saved to {out_path} — {corrected_pct:.1f}% of the canvas was repainted from the model's call.")
+    corrected_display = _apply_canvas_corrections(hedge_mask_display, canvas_result.image_data)
+    corrected_full = cv2.resize(
+        corrected_display.astype(np.uint8), (orig_w, orig_h), interpolation=cv2.INTER_NEAREST
+    ).astype(bool)
+    corrected_pct = 100.0 * np.count_nonzero(corrected_display != hedge_mask_display) / hedge_mask_display.size
+
+    save_col, download_col = st.columns(2)
+    with save_col:
+        if st.button("Save annotation for this image", type="primary"):
+            if github_push_configured():
+                try:
+                    commit_url = push_annotation_to_github(image_name, corrected_full)
+                    st.success(
+                        f"Pushed to GitHub ({corrected_pct:.1f}% of the canvas repainted). "
+                        + (f"[View commit]({commit_url})" if commit_url else "")
+                    )
+                except RuntimeError as exc:
+                    st.error(f"GitHub push failed, falling back to local save: {exc}")
+                    out_path = save_annotation_text(image_name, corrected_full)
+                    st.warning(f"Saved locally to {out_path} instead — download it below and send it back.")
+            else:
+                out_path = save_annotation_text(image_name, corrected_full)
+                st.success(
+                    f"Saved to {out_path} ({corrected_pct:.1f}% of the canvas repainted). "
+                    "Running remotely without GITHUB_TOKEN configured? Use the download "
+                    "button instead — local disk on a hosted server may not persist."
+                )
+    with download_col:
+        st.download_button(
+            "Download annotation .txt",
+            data=annotation_text(image_name, corrected_full),
+            file_name=f"{Path(image_name).stem}.txt",
+            mime="text/plain",
+        )
 
 
 def main():
