@@ -1244,8 +1244,23 @@ def render_pixel_annotation_tab():
         )
 
     image_name = image_names[st.session_state.anno_index]
-    status = "already annotated" if Path(image_name).stem in annotated_stems else "not yet annotated"
+    is_annotated = Path(image_name).stem in annotated_stems
+    status = "already annotated" if is_annotated else "not yet annotated"
     st.markdown(f"**{image_name}** ({st.session_state.anno_index + 1} / {len(image_names)}) — {status}")
+
+    if "anno_unlocked" not in st.session_state:
+        st.session_state.anno_unlocked = set()
+
+    if is_annotated and image_name not in st.session_state.anno_unlocked:
+        st.warning(
+            f"**{image_name}** already has an annotation saved. Re-annotating will "
+            "overwrite it once you save. Move on with Previous/Next above, or "
+            "choose below."
+        )
+        if st.button("Re-annotate this image", key=f"anno_reannotate_{image_name}"):
+            st.session_state.anno_unlocked.add(image_name)
+            st.rerun()
+        return
 
     image_bgr = load_image(image_name)
     orig_h, orig_w = image_bgr.shape[:2]
@@ -1308,6 +1323,7 @@ def render_pixel_annotation_tab():
                 try:
                     commit_url = push_annotation_to_github(image_name, corrected_full)
                     _list_github_annotation_stems.clear()
+                    st.session_state.anno_unlocked.discard(image_name)
                     st.success(
                         f"Pushed to GitHub ({corrected_pct:.1f}% of the canvas repainted). "
                         + (f"[View commit]({commit_url})" if commit_url else "")
@@ -1315,9 +1331,11 @@ def render_pixel_annotation_tab():
                 except RuntimeError as exc:
                     st.error(f"GitHub push failed, falling back to local save: {exc}")
                     out_path = save_annotation_text(image_name, corrected_full)
+                    st.session_state.anno_unlocked.discard(image_name)
                     st.warning(f"Saved locally to {out_path} instead — download it below and send it back.")
             else:
                 out_path = save_annotation_text(image_name, corrected_full)
+                st.session_state.anno_unlocked.discard(image_name)
                 st.success(
                     f"Saved to {out_path} ({corrected_pct:.1f}% of the canvas repainted). "
                     "Running remotely without GITHUB_TOKEN configured? Use the download "
