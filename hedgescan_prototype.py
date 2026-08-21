@@ -834,6 +834,7 @@ def render_labeling_tab():
 # Pixel annotation (full hedge/not-hedge mask correction -> annotation_data/)
 # ---------------------------------------------------------------------------
 ANNOTATION_DIR = Path("annotation_data")
+DEFAULT_DATASET_DIR = "Dataset"
 ANNOTATION_CANVAS_DISPLAY_WIDTH = 650
 ANNOTATION_HEDGE_COLOR = (0, 200, 0)      # green, displayed RGB
 ANNOTATION_NOT_HEDGE_COLOR = (220, 30, 30)  # red, displayed RGB
@@ -1174,7 +1175,10 @@ def render_pixel_annotation_tab():
         "text file, one per photo."
     )
 
-    data_dir = Path(st.text_input("Dataset folder (relative to the app)", value="Dataset", key="anno_data_dir"))
+    if st.session_state.get("dev_mode_toggle", False):
+        data_dir = Path(st.text_input("Dataset folder (relative to the app)", value=DEFAULT_DATASET_DIR, key="anno_data_dir"))
+    else:
+        data_dir = Path(DEFAULT_DATASET_DIR)
     try:
         image_names, load_image = _dataset_image_source(data_dir)
     except RuntimeError as exc:
@@ -1385,7 +1389,10 @@ def render_pixel_annotation_tab():
 def render_progress_tab():
     st.subheader("Annotation progress")
 
-    data_dir = Path(st.text_input("Dataset folder (relative to the app)", value="Dataset", key="progress_data_dir"))
+    if st.session_state.get("dev_mode_toggle", False):
+        data_dir = Path(st.text_input("Dataset folder (relative to the app)", value=DEFAULT_DATASET_DIR, key="progress_data_dir"))
+    else:
+        data_dir = Path(DEFAULT_DATASET_DIR)
     try:
         image_names, _ = _dataset_image_source(data_dir)
     except RuntimeError as exc:
@@ -1430,7 +1437,7 @@ def main():
         "Not the mobile app."
     )
 
-    dev_mode = st.sidebar.checkbox("Show developer tools", value=False)
+    dev_mode = st.sidebar.checkbox("Show developer tools", value=False, key="dev_mode_toggle")
 
     tab_names = ["Annotate", "Progress"]
     if dev_mode:
