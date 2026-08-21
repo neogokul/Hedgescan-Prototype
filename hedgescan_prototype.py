@@ -719,21 +719,31 @@ def render_labeling_tab():
             st.session_state.label_index = 0
         st.session_state.label_index = max(0, min(len(images) - 1, st.session_state.label_index))
 
+        def _label_go_prev():
+            st.session_state.label_index = max(0, st.session_state.label_index - 1)
+
+        def _label_go_next():
+            st.session_state.label_index = min(len(images) - 1, st.session_state.label_index + 1)
+
         nav1, nav2, nav3 = st.columns([1, 2, 1])
         with nav1:
-            if st.button("< Previous", disabled=st.session_state.label_index == 0):
-                st.session_state.label_index -= 1
+            st.button(
+                "< Previous", disabled=st.session_state.label_index == 0,
+                key="label_prev_btn", on_click=_label_go_prev,
+            )
         with nav3:
-            if st.button("Next >", disabled=st.session_state.label_index >= len(images) - 1):
-                st.session_state.label_index += 1
+            st.button(
+                "Next >", disabled=st.session_state.label_index >= len(images) - 1,
+                key="label_next_btn", on_click=_label_go_next,
+            )
         with nav2:
-            st.session_state.label_index = st.number_input(
+            st.number_input(
                 "Image index",
                 min_value=0,
                 max_value=len(images) - 1,
-                value=st.session_state.label_index,
                 step=1,
                 label_visibility="collapsed",
+                key="label_index",
             )
 
         image_path = images[st.session_state.label_index]
@@ -1210,17 +1220,27 @@ def render_pixel_annotation_tab():
         st.session_state.anno_index = 0
     st.session_state.anno_index = max(0, min(len(image_names) - 1, st.session_state.anno_index))
 
+    def _anno_go_prev():
+        st.session_state.anno_index = max(0, st.session_state.anno_index - 1)
+
+    def _anno_go_next():
+        st.session_state.anno_index = min(len(image_names) - 1, st.session_state.anno_index + 1)
+
     nav1, nav2, nav3 = st.columns([1, 2, 1])
     with nav1:
-        if st.button("< Previous", disabled=st.session_state.anno_index == 0, key="anno_prev"):
-            st.session_state.anno_index -= 1
+        st.button(
+            "< Previous", disabled=st.session_state.anno_index == 0,
+            key="anno_prev", on_click=_anno_go_prev,
+        )
     with nav3:
-        if st.button("Next >", disabled=st.session_state.anno_index >= len(image_names) - 1, key="anno_next"):
-            st.session_state.anno_index += 1
+        st.button(
+            "Next >", disabled=st.session_state.anno_index >= len(image_names) - 1,
+            key="anno_next", on_click=_anno_go_next,
+        )
     with nav2:
-        st.session_state.anno_index = st.number_input(
+        st.number_input(
             "Image index", min_value=0, max_value=len(image_names) - 1,
-            value=st.session_state.anno_index, step=1, label_visibility="collapsed", key="anno_index_input",
+            step=1, label_visibility="collapsed", key="anno_index",
         )
 
     image_name = image_names[st.session_state.anno_index]
