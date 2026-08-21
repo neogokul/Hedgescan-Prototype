@@ -894,9 +894,10 @@ def save_annotation_text(image_name: str, label_grid: np.ndarray) -> Path:
     """
     Write a full-resolution hedge/not-hedge annotation as run-length-encoded
     text: a small header (image name, width, height) followed by one RLE
-    line per image row. 1 = hedge material, 0 = not hedge (gap, other
-    vegetation, person, background, etc). See rle_lines_to_label_grid for
-    the matching reader.
+    line per image row. 1 = the specific hedgerow being surveyed, 0 =
+    anything else (gap, other trees/vegetation, grass, flowers, person,
+    background, etc) — a human judgement call, not the raw classifier
+    output. See rle_lines_to_label_grid for the matching reader.
     """
     ANNOTATION_DIR.mkdir(exist_ok=True)
     height, width = label_grid.shape
@@ -904,7 +905,7 @@ def save_annotation_text(image_name: str, label_grid: np.ndarray) -> Path:
         f"image: {image_name}",
         f"width: {width}",
         f"height: {height}",
-        "# 1=hedge material, 0=not hedge; each line below is one row, run-length encoded",
+        "# 1=the surveyed hedgerow, 0=everything else; each line below is one row, run-length encoded",
     ]
     lines.extend(_label_grid_to_rle_lines(label_grid))
     out_path = ANNOTATION_DIR / f"{Path(image_name).stem}.txt"
@@ -940,11 +941,17 @@ def rle_lines_to_label_grid(text: str) -> np.ndarray:
 def render_pixel_annotation_tab():
     st.subheader("Pixel annotation: repaint hedgerow vs. everything else")
     st.caption(
-        "The system marks what it currently thinks is hedge material in "
-        "green and everything else (gaps, other trees, flowers, people, "
-        "background) in red. Paint over its mistakes, then save — the "
-        "corrected full mask is written to `annotation_data/` as a text "
-        "file, one per photo."
+        "The green/red you see below is only the classifier's naive "
+        "foliage-color guess — it flags anything green as 'hedge', so it "
+        "routinely mislabels background trees, other plants, and grass as "
+        "green too. It is a rough starting point, not a claim about which "
+        "green is the surveyed hedgerow. Paint over ALL of it so the "
+        "result reflects only your own judgement: green = the specific "
+        "hedgerow being surveyed, red = everything else (gaps, other "
+        "trees, other plants, grass, flowers, people, background) — the "
+        "same rule regardless of what the system originally guessed. "
+        "Saving writes the corrected full mask to `annotation_data/` as a "
+        "text file, one per photo."
     )
 
     data_dir = Path(st.text_input("Dataset folder (relative to the app)", value="Dataset", key="anno_data_dir"))
@@ -998,7 +1005,7 @@ def render_pixel_annotation_tab():
     with img_col2:
         st.image(
             _classification_overlay_rgb(image_rgb_full, hedge_mask_full),
-            caption="System's current call — green = hedge, red = everything else (50% opacity, photo underneath)",
+            caption="System's raw foliage-color guess (green = any green pixel, not specifically the surveyed hedgerow) — 50% opacity, photo underneath",
         )
 
     st.markdown(
