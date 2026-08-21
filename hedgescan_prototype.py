@@ -1044,6 +1044,40 @@ def _dataset_image_source(data_dir: Path):
     return names, (lambda name: _load_github_dataset_image(repo, branch, name))
 
 
+def _next_dataset_index(image_names: list) -> int:
+    """One past the highest numeric filename stem seen (e.g. 19.jpg -> 20);
+    non-numeric filenames (like the original iStock names) don't count."""
+    numeric_stems = [int(Path(n).stem) for n in image_names if Path(n).stem.isdigit()]
+    return (max(numeric_stems) + 1) if numeric_stems else 1
+
+
+def push_dataset_image_to_github(name: str, file_bytes: bytes) -> str:
+    """Create <name> on the GITHUB_DATASET_BRANCH branch via the Contents
+    API. Same shape as push_annotation_to_github; raises RuntimeError on
+    any failure so the caller can fall back or report it."""
+    import base64
+
+    import requests
+
+    token = os.environ.get("GITHUB_TOKEN")
+    repo = os.environ.get("GITHUB_REPO")
+    branch = os.environ.get("GITHUB_DATASET_BRANCH", "Dataset")
+    if not token or not repo:
+        raise RuntimeError("GITHUB_TOKEN / GITHUB_REPO not configured")
+
+    api_url = f"https://api.github.com/repos/{repo}/contents/{name}"
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
+    payload = {
+        "message": f"Add dataset photo {name}",
+        "content": base64.b64encode(file_bytes).decode("ascii"),
+        "branch": branch,
+    }
+    response = requests.put(api_url, headers=headers, json=payload, timeout=30)
+    if response.status_code not in (200, 201):
+        raise RuntimeError(f"GitHub PUT failed ({response.status_code}): {response.text[:200]}")
+    return response.json().get("commit", {}).get("html_url", "")
+
+
 def rle_lines_to_label_grid(text: str) -> np.ndarray:
     """Inverse of save_annotation_text's RLE body, for reading annotations back."""
     lines = text.splitlines()
@@ -1090,12 +1124,44 @@ def render_pixel_annotation_tab():
         image_names, load_image = _dataset_image_source(data_dir)
     except RuntimeError as exc:
         st.error(f"Could not list dataset photos from GitHub: {exc}")
-        return
+        image_names, load_image = [], None
+
+    with st.expander(f"Upload new photos ({len(image_names)} in the dataset so far)"):
+        uploaded_files = st.file_uploader(
+            "Add photos — each gets numbered automatically, continuing after the highest number already used",
+            type=["jpg", "jpeg", "png"],
+            accept_multiple_files=True,
+            key="anno_upload",
+        )
+        if uploaded_files and st.button(f"Upload {len(uploaded_files)} photo(s)", key="anno_upload_btn"):
+            next_index = _next_dataset_index(image_names)
+            use_github = github_push_configured()
+            results = []
+            for offset, uploaded_file in enumerate(uploaded_files):
+                index = next_index + offset
+                suffix = Path(uploaded_file.name).suffix.lower() or ".jpg"
+                new_name = f"{index}{suffix}"
+                file_bytes = uploaded_file.getvalue()
+                try:
+                    if use_github:
+                        push_dataset_image_to_github(new_name, file_bytes)
+                    else:
+                        data_dir.mkdir(parents=True, exist_ok=True)
+                        (data_dir / new_name).write_bytes(file_bytes)
+                    results.append(f"{uploaded_file.name} -> {new_name}")
+                except RuntimeError as exc:
+                    st.error(f"{uploaded_file.name}: upload failed — {exc}")
+            if results:
+                if use_github:
+                    _list_github_dataset_images.clear()
+                st.success("Uploaded:\n" + "\n".join(results))
+                st.rerun()
+
     if not image_names:
         st.info(
             f"No images found in `{data_dir}/`, and no GITHUB_REPO configured to fall "
-            "back to. Point the folder at 1.jpg .. 19.jpg, or set GITHUB_REPO / "
-            "GITHUB_DATASET_BRANCH so this can fetch them from GitHub instead."
+            "back to. Point the folder at 1.jpg .. 19.jpg, upload some above, or set "
+            "GITHUB_REPO / GITHUB_DATASET_BRANCH so this can fetch them from GitHub instead."
         )
         return
 
@@ -1155,7 +1221,10 @@ def render_pixel_annotation_tab():
         paint_label = st.radio("Brush", ["Hedge (green)", "Not hedge (red)"], key="anno_brush", horizontal=True)
     with paint_col2:
         brush_size = st.slider("Brush size", min_value=2, max_value=60, value=15, key="anno_brush_size")
-    stroke_color = "rgb(0,200,0)" if paint_label.startswith("Hedge") else "rgb(220,30,30)"
+    # 80% opaque (not fully solid) so the photo stays faintly visible under a
+    # brush stroke too — otherwise there's no way to tell, after painting,
+    # whether a stroke landed exactly where intended.
+    stroke_color = "rgba(0,200,0,0.8)" if paint_label.startswith("Hedge") else "rgba(220,30,30,0.8)"
 
     pil_bg = Image.fromarray(_classification_overlay_rgb(image_rgb_display, hedge_mask_display))
     canvas_result = st_canvas(
