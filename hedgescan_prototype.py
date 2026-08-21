@@ -1044,6 +1044,43 @@ def _dataset_image_source(data_dir: Path):
     return names, (lambda name: _load_github_dataset_image(repo, branch, name))
 
 
+@st.cache_data(ttl=300, show_spinner="Checking annotation progress on GitHub...")
+def _list_github_annotation_stems(repo: str, branch: str) -> list:
+    """Filename stems (no extension) of annotation_data/*.txt on the given
+    branch, via the Contents API. Short TTL (5 min, vs 1 hour for the
+    dataset photo list) since this is expected to change often as people
+    annotate."""
+    import requests
+
+    headers = {"Accept": "application/vnd.github+json"}
+    if os.environ.get("GITHUB_TOKEN"):
+        headers["Authorization"] = f"Bearer {os.environ['GITHUB_TOKEN']}"
+    response = requests.get(
+        f"https://api.github.com/repos/{repo}/contents/annotation_data",
+        headers=headers, params={"ref": branch}, timeout=15,
+    )
+    if response.status_code == 404:
+        return []  # folder doesn't exist yet - nothing annotated
+    if response.status_code != 200:
+        raise RuntimeError(f"GitHub listing failed ({response.status_code}): {response.text[:200]}")
+    return [Path(item["name"]).stem for item in response.json() if item["name"].endswith(".txt")]
+
+
+def _annotated_stems_source() -> set:
+    """Set of annotated photo stems, preferring the local annotation_data/
+    folder when it has files, else the annotation-data GitHub branch."""
+    if ANNOTATION_DIR.is_dir():
+        local_stems = {p.stem for p in ANNOTATION_DIR.glob("*.txt")}
+        if local_stems:
+            return local_stems
+
+    repo = os.environ.get("GITHUB_REPO")
+    if not repo:
+        return set()
+    branch = os.environ.get("GITHUB_ANNOTATION_BRANCH", "annotation-data")
+    return set(_list_github_annotation_stems(repo, branch))
+
+
 def _next_dataset_index(image_names: list) -> int:
     """One past the highest numeric filename stem seen (e.g. 19.jpg -> 20);
     non-numeric filenames (like the original iStock names) don't count."""
@@ -1166,7 +1203,7 @@ def render_pixel_annotation_tab():
         return
 
     ANNOTATION_DIR.mkdir(exist_ok=True)
-    annotated_stems = {p.stem for p in ANNOTATION_DIR.glob("*.txt")}
+    annotated_stems = _annotated_stems_source()
     st.caption(f"{len(annotated_stems)} / {len(image_names)} images annotated so far, saved under `{ANNOTATION_DIR}/`.")
 
     if "anno_index" not in st.session_state:
@@ -1250,6 +1287,7 @@ def render_pixel_annotation_tab():
             if github_push_configured():
                 try:
                     commit_url = push_annotation_to_github(image_name, corrected_full)
+                    _list_github_annotation_stems.clear()
                     st.success(
                         f"Pushed to GitHub ({corrected_pct:.1f}% of the canvas repainted). "
                         + (f"[View commit]({commit_url})" if commit_url else "")
@@ -1274,6 +1312,45 @@ def render_pixel_annotation_tab():
         )
 
 
+def render_progress_tab():
+    st.subheader("Annotation progress")
+
+    data_dir = Path(st.text_input("Dataset folder (relative to the app)", value="Dataset", key="progress_data_dir"))
+    try:
+        image_names, _ = _dataset_image_source(data_dir)
+    except RuntimeError as exc:
+        st.error(f"Could not list dataset photos from GitHub: {exc}")
+        return
+    if not image_names:
+        st.info(f"No dataset photos found yet — upload some in the Annotate tab first.")
+        return
+
+    annotated_stems = _annotated_stems_source()
+    all_stems = [Path(name).stem for name in image_names]
+    done = [s for s in all_stems if s in annotated_stems]
+    remaining = [s for s in all_stems if s not in annotated_stems]
+    fraction = len(done) / len(all_stems) if all_stems else 0.0
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Photos in dataset", len(all_stems))
+    col2.metric("Annotated", len(done))
+    col3.metric("Remaining", len(remaining))
+    st.progress(fraction, text=f"{fraction * 100:.0f}% complete")
+
+    def numeric_sort(stems):
+        return sorted(stems, key=lambda s: (0, int(s)) if s.isdigit() else (1, s))
+
+    with st.expander(f"Still needed ({len(remaining)})", expanded=len(remaining) > 0):
+        st.write(", ".join(numeric_sort(remaining)) if remaining else "None — every photo has been annotated.")
+    with st.expander(f"Already done ({len(done)})"):
+        st.write(", ".join(numeric_sort(done)) if done else "None yet.")
+
+    if st.button("Refresh progress", key="progress_refresh"):
+        _list_github_annotation_stems.clear()
+        _list_github_dataset_images.clear()
+        st.rerun()
+
+
 def main():
     st.set_page_config(page_title="HedgeScan Phase 0 Prototype", layout="wide")
     st.title("HedgeScan — Phase 0 Vision Prototype")
@@ -1283,15 +1360,24 @@ def main():
         "Not the mobile app."
     )
 
-    tab1, tab2, tab3, tab4 = st.tabs(["Single image", "Section batch", "Labeling", "Pixel annotation"])
-    with tab1:
-        render_single_image_tab()
-    with tab2:
-        render_section_batch_tab()
-    with tab3:
-        render_labeling_tab()
-    with tab4:
+    dev_mode = st.sidebar.checkbox("Show developer tools", value=False)
+
+    tab_names = ["Annotate", "Progress"]
+    if dev_mode:
+        tab_names += ["Single image", "Section batch", "Labeling"]
+    tabs = st.tabs(tab_names)
+
+    with tabs[0]:
         render_pixel_annotation_tab()
+    with tabs[1]:
+        render_progress_tab()
+    if dev_mode:
+        with tabs[2]:
+            render_single_image_tab()
+        with tabs[3]:
+            render_section_batch_tab()
+        with tabs[4]:
+            render_labeling_tab()
 
 
 if __name__ == "__main__":
