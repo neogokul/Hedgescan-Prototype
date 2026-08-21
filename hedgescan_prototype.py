@@ -34,6 +34,7 @@ import cv2
 import numpy as np
 import streamlit as st
 from PIL import Image
+from streamlit_js_eval import streamlit_js_eval
 import streamlit.elements.image as _st_image
 
 # streamlit-drawable-canvas 0.9.3 (last released 2022) calls
@@ -1281,14 +1282,25 @@ def render_pixel_annotation_tab():
     orig_h, orig_w = image_bgr.shape[:2]
     hedge_mask_full = _hedge_material_mask(image_bgr)
 
-    scale = ANNOTATION_CANVAS_DISPLAY_WIDTH / orig_w
+    # Fixed-pixel canvas width overflowed narrow phone screens in portrait
+    # (fine on PC/landscape, where the viewport is wider than
+    # ANNOTATION_CANVAS_DISPLAY_WIDTH) — the canvas doesn't reflow like
+    # st.image does, so it just got clipped. streamlit_js_eval reads the
+    # real browser viewport width and we cap the canvas to fit it, with a
+    # margin for Streamlit's own page padding.
+    viewport_width = streamlit_js_eval(js_expressions="window.innerWidth", key="anno_viewport_width")
+    canvas_width = ANNOTATION_CANVAS_DISPLAY_WIDTH
+    if viewport_width:
+        canvas_width = max(280, min(ANNOTATION_CANVAS_DISPLAY_WIDTH, int(viewport_width) - 48))
+
+    scale = canvas_width / orig_w
     display_h = int(round(orig_h * scale))
     hedge_mask_display = cv2.resize(
-        hedge_mask_full.astype(np.uint8), (ANNOTATION_CANVAS_DISPLAY_WIDTH, display_h), interpolation=cv2.INTER_NEAREST
+        hedge_mask_full.astype(np.uint8), (canvas_width, display_h), interpolation=cv2.INTER_NEAREST
     ).astype(bool)
 
     image_rgb_full = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-    image_rgb_display = cv2.resize(image_rgb_full, (ANNOTATION_CANVAS_DISPLAY_WIDTH, display_h))
+    image_rgb_display = cv2.resize(image_rgb_full, (canvas_width, display_h))
 
     img_col1, img_col2 = st.columns(2)
     with img_col1:
@@ -1308,10 +1320,11 @@ def render_pixel_annotation_tab():
         paint_label = st.radio("Brush", ["Hedge (green)", "Not hedge (red)"], key="anno_brush", horizontal=True)
     with paint_col2:
         brush_size = st.slider("Brush size", min_value=2, max_value=60, value=15, key="anno_brush_size")
-    # 80% opaque (not fully solid) so the photo stays faintly visible under a
-    # brush stroke too — otherwise there's no way to tell, after painting,
+    # 50% opaque, matching the classification overlay's own opacity, so the
+    # photo stays visible under a brush stroke exactly as visibly as it does
+    # everywhere else — otherwise there's no way to tell, after painting,
     # whether a stroke landed exactly where intended.
-    stroke_color = "rgba(0,200,0,0.8)" if paint_label.startswith("Hedge") else "rgba(220,30,30,0.8)"
+    stroke_color = "rgba(0,200,0,0.5)" if paint_label.startswith("Hedge") else "rgba(220,30,30,0.5)"
 
     pil_bg = Image.fromarray(_classification_overlay_rgb(image_rgb_display, hedge_mask_display))
     canvas_result = st_canvas(
@@ -1320,7 +1333,7 @@ def render_pixel_annotation_tab():
         stroke_color=stroke_color,
         background_image=pil_bg,
         height=display_h,
-        width=ANNOTATION_CANVAS_DISPLAY_WIDTH,
+        width=canvas_width,
         drawing_mode="freedraw",
         key=f"anno_canvas_{image_name}",
     )
