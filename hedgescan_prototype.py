@@ -725,6 +725,9 @@ def render_labeling_tab():
         def _label_go_next():
             st.session_state.label_index = min(len(images) - 1, st.session_state.label_index + 1)
 
+        def _label_index_from_display():
+            st.session_state.label_index = st.session_state.label_index_display - 1
+
         nav1, nav2, nav3 = st.columns([1, 2, 1])
         with nav1:
             st.button(
@@ -737,13 +740,17 @@ def render_labeling_tab():
                 key="label_next_btn", on_click=_label_go_next,
             )
         with nav2:
+            # Displayed as 1-based, matching the filenames; label_index
+            # itself stays 0-based since it indexes directly into images.
+            st.session_state.label_index_display = st.session_state.label_index + 1
             st.number_input(
-                "Image index",
-                min_value=0,
-                max_value=len(images) - 1,
+                "Image number",
+                min_value=1,
+                max_value=len(images),
                 step=1,
                 label_visibility="collapsed",
-                key="label_index",
+                key="label_index_display",
+                on_change=_label_index_from_display,
             )
 
         image_path = images[st.session_state.label_index]
@@ -1226,6 +1233,9 @@ def render_pixel_annotation_tab():
     def _anno_go_next():
         st.session_state.anno_index = min(len(image_names) - 1, st.session_state.anno_index + 1)
 
+    def _anno_index_from_display():
+        st.session_state.anno_index = st.session_state.anno_index_display - 1
+
     nav1, nav2, nav3 = st.columns([1, 2, 1])
     with nav1:
         st.button(
@@ -1238,9 +1248,14 @@ def render_pixel_annotation_tab():
             key="anno_next", on_click=_anno_go_next,
         )
     with nav2:
+        # Displayed as 1-based (matches the 1.jpg, 2.jpg... filenames) while
+        # anno_index itself stays 0-based internally, since it's used
+        # directly to index into image_names everywhere else below.
+        st.session_state.anno_index_display = st.session_state.anno_index + 1
         st.number_input(
-            "Image index", min_value=0, max_value=len(image_names) - 1,
-            step=1, label_visibility="collapsed", key="anno_index",
+            "Image number", min_value=1, max_value=len(image_names),
+            step=1, label_visibility="collapsed", key="anno_index_display",
+            on_change=_anno_index_from_display,
         )
 
     image_name = image_names[st.session_state.anno_index]
