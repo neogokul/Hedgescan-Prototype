@@ -1285,13 +1285,17 @@ def render_pixel_annotation_tab():
     # Fixed-pixel canvas width overflowed narrow phone screens in portrait
     # (fine on PC/landscape, where the viewport is wider than
     # ANNOTATION_CANVAS_DISPLAY_WIDTH) — the canvas doesn't reflow like
-    # st.image does, so it just got clipped. streamlit_js_eval reads the
-    # real browser viewport width and we cap the canvas to fit it, with a
-    # margin for Streamlit's own page padding.
+    # st.image does, so it just got clipped. streamlit_js_eval runs inside
+    # its own component iframe, which Streamlit already sizes to the page's
+    # padded content width (confirmed by measurement: window.innerWidth
+    # there matches st.image's own rendered width exactly, e.g. both 358px
+    # on a 390px-wide iPhone viewport) — so that value needs only a tiny
+    # safety margin, not a large guessed one, or the canvas ends up
+    # needlessly smaller than the images above it.
     viewport_width = streamlit_js_eval(js_expressions="window.innerWidth", key="anno_viewport_width")
     canvas_width = ANNOTATION_CANVAS_DISPLAY_WIDTH
     if viewport_width:
-        canvas_width = max(280, min(ANNOTATION_CANVAS_DISPLAY_WIDTH, int(viewport_width) - 48))
+        canvas_width = max(280, min(ANNOTATION_CANVAS_DISPLAY_WIDTH, int(viewport_width) - 4))
 
     scale = canvas_width / orig_w
     display_h = int(round(orig_h * scale))
